@@ -1,12 +1,13 @@
 """Make constants of an existing C file tunable without editing it by hand.
 
-    candidates(path)                     -> file-level numeric constants that can be tuned
+    candidates(path)                     -> numeric constants that can be tuned
     lift(path, names, out)               -> writes a copy of the file where those constants are `learned`
                                             (real numbers) or `learned_num` (whole numbers), starting from their
                                             original values; the original file is not changed.
     apply(path, values, out)             -> writes a copy of the ORIGINAL file with only those values replaced.
-Covered: file-level variables of arithmetic type (or arrays of them) with an initial value, usually
-`static const ...`. Not covered: #define constants and constants inside functions (they are not variables).
+Covered: variables of arithmetic type (or arrays of them) with an initial value, usually `static const ...`, at file
+level or `static` inside a function, in .c files and in headers. Not covered: #define constants and non-static
+constants inside functions (they are not variables).
 """
 import json, os, re
 from .build import CLANG, INCLUDE, _run
@@ -25,46 +26,87 @@ def _base(qt):
     return (re.sub(r"\s+", " ", m.group(1)).strip(), m.group(2)) if m else (t, "")
 
 
+def _is_constant(d, path):
+    """A variable of arithmetic type (or an array of them) with an initial value, declared in this file."""
+    if d.get("kind") != "VarDecl" or "inner" not in d: return None
+    loc = d.get("loc", {}); loc = loc.get("expansionLoc", loc)
+    if "includedFrom" in loc or ("file" in loc and os.path.abspath(loc["file"]) != os.path.abspath(path)): return None
+    if any(i.get("kind") == "AnnotateAttr" for i in d["inner"]): return None                # already learned
+    if not any("Literal" in i.get("kind", "") or i.get("kind") in ("InitListExpr", "ImplicitCastExpr", "UnaryOperator")
+               for i in d["inner"]): return None
+    qt = d["type"].get("desugaredQualType", d["type"]["qualType"])
+    base, _ = _base(qt)
+    kind = "real" if base in FLOAT_TYPES else "whole" if base in INT_TYPES else None
+    if kind is None or "*" in qt: return None
+    return kind, loc
+
+
+def _walk(node):
+    for i in node.get("inner", []) or []:
+        yield i
+        yield from _walk(i)
+
+
 def candidates(path, flags=()):
-    """[{name, type, kind ('real' | 'whole'), offset, end, name_offset, value_text}] for liftable constants."""
-    tree = json.loads(_run([CLANG, "-I", INCLUDE, *flags, "-Xclang", "-ast-dump=json", "-fsyntax-only", path]))
+    """[{name, type, kind ('real' | 'whole'), offset, end, name_offset, text, function}] for liftable constants:
+    file-level ones, and `static` ones inside functions (function: the function's name and where it starts).
+    Headers (.h) are parsed as C, so pass the -D flags that enable their implementation part."""
+    lang = ["-x", "c"] if path.endswith(".h") else []
+    tree = json.loads(_run([CLANG, "-I", INCLUDE, *flags, *lang, "-Xclang", "-ast-dump=json", "-fsyntax-only", path]))
     src = open(path, "rb").read()
     out = []
-    for d in tree.get("inner", []):
-        if d.get("kind") != "VarDecl" or "inner" not in d: continue
-        loc = d.get("loc", {}); loc = loc.get("expansionLoc", loc)
-        if "includedFrom" in loc or loc.get("file", path) not in (path, None) and "file" in loc and os.path.abspath(loc["file"]) != os.path.abspath(path):
-            continue
-        if any(i.get("kind") == "AnnotateAttr" for i in d["inner"]): continue          # already learned
-        if not any("Literal" in i.get("kind", "") or i.get("kind") in ("InitListExpr", "ImplicitCastExpr", "UnaryOperator") for i in d["inner"]):
-            continue
-        qt = d["type"].get("desugaredQualType", d["type"]["qualType"])
-        base, dims = _base(qt)
-        kind = "real" if base in FLOAT_TYPES else "whole" if base in INT_TYPES else None
-        if kind is None or "*" in qt: continue
+
+    def add(d, kind, loc, function=None):
         b = d["range"]["begin"]; b = b.get("expansionLoc", b)
         e = d["range"]["end"]; e = e.get("expansionLoc", e)
         start, end = b["offset"], e["offset"] + e.get("tokLen", 0)
         out.append({"name": d["name"], "type": d["type"]["qualType"], "kind": kind, "offset": start, "end": end,
-                    "name_offset": loc["offset"], "text": src[start:end].decode(errors="replace")})
+                    "name_offset": loc["offset"], "text": src[start:end].decode(errors="replace"), "function": function})
+
+    for d in tree.get("inner", []):
+        found = _is_constant(d, path)
+        if found: add(d, *found); continue
+        if d.get("kind") != "FunctionDecl" or not any(i.get("kind") == "CompoundStmt" for i in d.get("inner", [])): continue
+        b = d["range"]["begin"]; b = b.get("expansionLoc", b)
+        if b.get("file", path) != path and "file" in b and os.path.abspath(b["file"]) != os.path.abspath(path): continue
+        for v in _walk(d):
+            if v.get("kind") == "VarDecl" and v.get("storageClass") == "static":
+                found = _is_constant(v, path)
+                if found: add(v, *found, function=(d["name"], b["offset"]))
+    names = [c["name"] for c in out]
+    for c in out: c["ambiguous"] = names.count(c["name"]) > 1
     return out
 
 
 def lift(path, names, out_path, flags=()):
-    """Write a copy of `path` in which the named constants are tunable. Returns the list of lifted constants."""
-    cands = {c["name"]: c for c in candidates(path, flags)}
+    """Write a copy of `path` in which the named constants are tunable. Returns the list of lifted constants.
+    A constant declared `static` inside a function is moved to just before that function (same name), so it can be
+    set from outside."""
+    all_cands = candidates(path, flags)
+    cands = {c["name"]: c for c in all_cands if not c["ambiguous"]}
     if names in (None, "all"): names = list(cands)
+    ambiguous = sorted({c["name"] for c in all_cands if c["ambiguous"]} & set(names))
+    if ambiguous: raise ValueError(f"cannot tune {ambiguous}: several constants in {os.path.basename(path)} have that name")
     missing = [n for n in names if n not in cands]
     if missing:
-        raise ValueError(f"cannot tune {missing}: not file-level numeric constants with a value in {os.path.basename(path)}"
+        raise ValueError(f"cannot tune {missing}: not numeric constants with a value in {os.path.basename(path)}"
                          f" (liftable: {sorted(cands)})")
-    src = open(path, "rb").read().decode()
-    data = src.encode()
-    for c in sorted((cands[n] for n in names), key=lambda c: -c["offset"]):
+    data = open(path, "rb").read()
+    edits = []                                                           # (offset, end, replacement)
+    for c in (cands[n] for n in names):
         decl = data[c["offset"]:c["name_offset"]].decode()               # everything before the variable's name
-        prefix = re.sub(r"\bconst\b\s*", "", decl)
         macro = "learned " if c["kind"] == "real" else "learned_num "
-        data = data[:c["offset"]] + (macro + prefix).encode() + data[c["name_offset"]:]
+        prefix = macro + re.sub(r"\bconst\b\s*", "", decl)
+        if c["function"] is None:
+            edits.append((c["offset"], c["name_offset"], prefix))
+        else:                                                            # move it out of the function
+            if "static" not in prefix: prefix = "static " + prefix
+            whole = prefix + data[c["name_offset"]:c["end"]].decode()
+            stop = data.index(b";", c["end"]) + 1
+            edits.append((c["offset"], stop, f"/* {c['name']}: moved before {c['function'][0]} by learnc */"))
+            edits.append((c["function"][1], c["function"][1], whole + ";\n"))
+    for a, b, text in sorted(edits, key=lambda e: (-e[0], -e[1])):
+        data = data[:a] + text.encode() + data[b:]
     text = data.decode()
     text = '#include <learnc.h>   /* added by learnc: tunable constants */\n#include <string.h>\n#line 1\n' + text
     # setters, so the tuner can change constants that are `static` (visible only inside this file)
@@ -95,7 +137,7 @@ def apply(path, values, out_path, flags=(), originals=None):
     unchanged constants as written (default: compare with the numbers in the source text).
     Returns the names whose values changed."""
     import numpy as np
-    cands = {c["name"]: c for c in candidates(path, flags)}
+    cands = {c["name"]: c for c in candidates(path, flags) if not c["ambiguous"]}
     data, changed = open(path, "rb").read(), []
     for c in sorted((cands[n] for n in values if n in cands), key=lambda c: -c["offset"]):
         base, dims = _base(c["type"])

@@ -35,7 +35,18 @@ def _report(prog, x, y):
 def _values_path(p): return os.path.splitext(p)[0] + ".values.pt"
 
 
+def _join_cflags(argv):
+    """`--cflags -DX` would look like an option to argparse: join it into `--cflags=-DX`."""
+    out = []
+    for a in argv:
+        if out and out[-1] == "--cflags": out[-1] = f"--cflags={a}"
+        else: out.append(a)
+    return out
+
+
 def main(argv=None):
+    import sys
+    argv = _join_cflags(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(prog="learnc", description="Fit the `learned` variables of a C program to examples.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("fit", "run", "show"):

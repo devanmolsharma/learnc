@@ -66,3 +66,46 @@ def test_tune_command_line(tmp_path):
     assert res.returncode == 0, res.stderr[-2000:]
     assert "kWindow: 4  ->  7" in res.stdout, res.stdout[-2000:]
     assert (tmp_path / "out" / "peak.c").exists() and (tmp_path / "out" / "TUNING_REPORT.txt").exists()
+
+
+HEADER = """
+    #ifdef SCALE_IMPLEMENTATION
+    float scale_sum(const float *x, int n) {
+        static const float weights[4] = { 1.0f, 1.0f, 1.0f, 1.0f };   /* inside a function, in a header */
+        float s = 0;
+        for (int i = 0; i < n; i++) s += weights[i % 4] * x[i];
+        return s;
+    }
+    #endif
+"""
+
+
+def test_tune_constant_inside_a_function_in_a_header(tmp_path):
+    inc = tmp_path / "include"; inc.mkdir()
+    header = inc / "scale.h"; header.write_text(textwrap.dedent(HEADER))
+    entry = tmp_path / "score.c"
+    entry.write_text('#include <stdio.h>\n#include "scale.h"\n'
+                     'float score(const float x[8]) { char b[32]; snprintf(b, 32, "%d", 1); return scale_sum(x, 8); }\n')
+    flags = ["-I", str(inc), "-DSCALE_IMPLEMENTATION"]
+    found = {c["name"]: c for c in learnc.candidates(str(header), flags)}
+    assert found["weights"]["function"][0] == "scale_sum"
+    x = torch.rand(800, 8, generator=torch.Generator().manual_seed(1))
+    w = torch.tensor([0.5, 2.0, -1.0, 3.0]).repeat(2)
+    before = header.read_text()
+    r = learnc.tune(str(entry), [x], (x * w).sum(1), constants={str(header): ["weights"]}, flags=flags,
+                    steps=300, lr=0.05, keep_close=0, workers=2)
+    assert header.read_text() == before
+    assert np.allclose(r.values["weights"].numpy(), [0.5, 2.0, -1.0, 3.0], atol=0.02), r.values
+    out = r.write(str(tmp_path / "tuned"))[0]
+    text = open(out).read()
+    assert "static const float weights[4] = { 0.5" in text and text.count("weights") == before.count("weights")
+
+
+def test_build_cache_sees_header_edits(tmp_path):
+    inc = tmp_path / "include"; inc.mkdir()
+    (inc / "k.h").write_text("#define K 2.0f\n")
+    src = tmp_path / "f.c"; src.write_text('#include "k.h"\nfloat f(float x) { return K * x; }\n')
+    x = torch.ones(4)
+    assert learnc.Program(str(src), device="cpu", flags=["-I", str(inc)]).native().run(x)[0].item() == 2.0
+    (inc / "k.h").write_text("#define K 3.0f\n")
+    assert learnc.Program(str(src), device="cpu", flags=["-I", str(inc)]).native().run(x)[0].item() == 3.0

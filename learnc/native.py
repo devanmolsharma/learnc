@@ -20,7 +20,7 @@ def _cname(t): return C_NAME[t[:2]] if t[0] == "fp" else C_NAME[t]
 class Native:
     def __init__(self, prog):
         self.prog = prog
-        d = cache_dir(prog.paths)
+        d = cache_dir(prog.paths, getattr(prog, "flags", ()))
         lines = [f'#include "{prog.path}"', "#include <string.h>"]
         local = set(learned_declarations(prog.path, getattr(prog, "flags", ())))    # learned variables of the entry file
         for n, L in prog.learned.items():

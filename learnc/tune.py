@@ -35,9 +35,9 @@ class TuneResult:
 
     def report(self):
         r = self.fit_report
-        lines = [f"validation loss: {r['validation_loss_start']:.6g} with the original constants -> "
-                 f"{r['validation_loss_final']:.6g} tuned "
-                 f"({100 * (1 - r['validation_loss_final'] / max(r['validation_loss_start'], 1e-300)):+.1f}%)"]
+        a, b = r["validation_loss_start"], r["validation_loss_final"]
+        change = f"{100 * (b / a - 1):+.1f}%" if a > 1e-9 and b >= 0 else f"{b - a:+.6g}"   # % only when meaningful
+        lines = [f"validation loss: {a:.6g} with the original constants -> {b:.6g} tuned ({change})"]
         for name, L in self.program.learned.items():
             old = np.asarray(L.init).reshape(-1); new = np.asarray(self.values[name]).reshape(-1)
             fmt = (lambda v: f"{v:g}") if L.etype[0] == "fp" else (lambda v: f"{int(round(v))}")
@@ -66,7 +66,8 @@ def tune(entry_file, inputs, target=None, *, entry=None, constants=None, sources
     """Tune constants of existing C code. See the module docstring.
 
     entry_file: C file with the function that takes ONE example (numbers, arrays, strings) and returns a number.
-    constants: {file: [constant names] or "all"}: file-level constants to tune (made tunable in working copies).
+    constants: {file: [constant names] or "all"}: constants to tune (made tunable in working copies). The file can
+      be a source of the program or a header it includes (include it with -I, not from the entry file's folder).
       Constants already marked `learned` in the code are tuned too.
     objective: "match" (output should equal target) or "minimize" (output is a cost); default: "minimize" when no
       target is given, else "match".
@@ -79,10 +80,12 @@ def tune(entry_file, inputs, target=None, *, entry=None, constants=None, sources
     lifted, flags = {}, list(flags)
     for f, names in (constants or {}).items():
         f = os.path.abspath(f)
-        if f not in files: raise ValueError(f"{f} is not among the program's files ({files})")
+        header = f.endswith(".h")
+        if f not in files and not header: raise ValueError(f"{f} is not among the program's files ({files})")
         out = os.path.join(work_dir, os.path.basename(f))
         lift(f, names, out, flags)
         lifted[f] = out
+        if header: flags = ["-I", work_dir] + flags                # #include "x.h" now finds the tunable copy first
         flags += ["-I", os.path.dirname(f)]                       # the copy still finds the original's headers
     files = [lifted.get(f, f) for f in files]
     prog = Program(files[0], sources=files[1:], entry=entry, device="cpu", flags=flags)

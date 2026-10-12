@@ -21,14 +21,26 @@ def _run(cmd):
     return p.stdout
 
 
-def cache_dir(paths):
-    h = hashlib.sha1(b"".join(open(p, "rb").read() + p.encode() for p in paths) + " ".join(FLAGS).encode()).hexdigest()[:12]
+def _dependencies(paths, extra):
+    """Every file the sources read, headers included (clang -M), so editing a header rebuilds."""
+    deps = set(paths)
+    for p in paths:
+        try: out = _run([CLANG, "-I", INCLUDE, *FLAGS, *extra, "-M", p])
+        except BuildError: continue
+        deps |= {d for d in out.replace("\\\n", " ").split()[1:] if os.path.exists(d)}
+    return sorted(deps)
+
+
+def cache_dir(paths, extra=()):
+    files = _dependencies(paths, extra)
+    h = hashlib.sha1(b"".join(open(p, "rb").read() + p.encode() for p in files)
+                     + " ".join([*FLAGS, *extra]).encode()).hexdigest()[:12]
     d = os.path.join(tempfile.gettempdir(), "learnc-cache", h); os.makedirs(d, exist_ok=True); return d
 
 
 def compile_ir(paths, extra=()):
     """C files (the program and the sources of any libraries it uses) -> one parsed LLVM IR module."""
-    paths = [os.path.abspath(p) for p in paths]; d = cache_dir(paths); outs = []
+    paths = [os.path.abspath(p) for p in paths]; d = cache_dir(paths, extra); outs = []
     for k, p in enumerate(paths):
         out = os.path.join(d, f"part{k}.ll"); _run([CLANG, *FLAGS, *extra, "-S", "-emit-llvm", p, "-o", out]); outs.append(out)
     final = outs[0]
