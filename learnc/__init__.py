@@ -5,4 +5,4 @@ from .lift import candidates, lift
 from .build import BuildError
 from .machine import RunError
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

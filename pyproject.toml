@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "learnc"
-version = "0.1.0"
+version = "0.1.1"
 description = "Auto-tune the magic numbers in C code from data: thresholds, tables and weights, written back as plain C."
 readme = "README.md"
 license = "MIT"
