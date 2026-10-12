@@ -1,5 +1,9 @@
 # learnc: auto-tune the magic numbers in your C code
 
+[![PyPI](https://img.shields.io/pypi/v/learnc)](https://pypi.org/project/learnc/)
+[![Python](https://img.shields.io/pypi/pyversions/learnc)](https://pypi.org/project/learnc/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/devanmolsharma/learnc/blob/main/LICENSE)
+
 **Every C codebase is full of hand-picked constants: thresholds, tables, weights, cutoffs. learnc tunes them from
 data and gives you back the same C file with better numbers.** No rewrite, no runtime library, no neural network in
 production. Just a smaller diff.
@@ -17,7 +21,7 @@ learnc tune score.c --data examples.pt --tune encoder.h:YQT,UVQT --out tuned/
 | **A 2x2 matrix product** | 84 coefficients | rediscovers a 7-multiplication **Strassen-type algorithm** from examples alone |
 | **Sorting networks** | which elements each step compares | finds **provably optimal** networks for 4 and 5 inputs |
 
-Each result runs on a laptop CPU in minutes and is reproducible from [`examples/`](examples).
+Each result runs on a laptop CPU in minutes and is reproducible from [`examples/`](https://github.com/devanmolsharma/learnc/tree/main/examples).
 
 ---
 
@@ -45,11 +49,22 @@ Each result runs on a laptop CPU in minutes and is reproducible from [`examples/
 ## Install
 
 ```bash
-git clone https://github.com/devanmolsharma/learnc && cd learnc
-pip install -e .            # needs clang and gcc on PATH
+pip install learnc
 ```
 
-Python 3.10+, PyTorch 2.2+ and NumPy.
+learnc also needs **clang**, **llvm-link** and **gcc** on your system:
+
+```bash
+sudo apt install clang llvm gcc        # Debian / Ubuntu
+brew install llvm gcc                  # macOS (add $(brew --prefix llvm)/bin to PATH)
+```
+
+Python 3.10+. PyTorch and NumPy are installed with it. To work on learnc itself:
+
+```bash
+git clone https://github.com/devanmolsharma/learnc && cd learnc
+pip install -e ".[dev]" && pytest
+```
 
 ## Quick start: tune existing code
 
@@ -138,15 +153,15 @@ trained model on all 10,000 test images.
 
 | Example | What is learned | Result |
 |---|---|---|
-| [`tune_jpeg/`](examples/tune_jpeg) | JPEG quantization tables of the unmodified stb encoder | 9.1% smaller at equal SSIM (libjpeg, held-out Kodak); 12.2% at equal PSNR |
-| [`tune_webrtc_vad/`](examples/tune_webrtc_vad) | constants of Google's unmodified WebRTC VAD | F1 0.810 to 0.859 on LibriParty eval |
-| [`mnist/`](examples/mnist) | 7,850 or 25,450 weights | 92.3% (linear) and 96.4% (MLP) on MNIST |
-| [`count/`](examples/count) | a counting rule, trained on lengths 1 to 10 | 97.1% exact on lengths 40 to 64; a neural network on the same data gets 0% |
-| [`rules/`](examples/rules) | which features a 2-of-3 rule reads, directions, thresholds | recovers the hidden rule |
-| [`formula/`](examples/formula) | inputs and operators of a formula | recovers `(x3 + x0) * (x1 - x2)` exactly in 11 s |
-| [`discover/`](examples/discover) | Strassen-type matrix product, sorting networks | finds exact and optimal algorithms |
+| [`tune_jpeg/`](https://github.com/devanmolsharma/learnc/tree/main/examples/tune_jpeg) | JPEG quantization tables of the unmodified stb encoder | 9.1% smaller at equal SSIM (libjpeg, held-out Kodak); 12.2% at equal PSNR |
+| [`tune_webrtc_vad/`](https://github.com/devanmolsharma/learnc/tree/main/examples/tune_webrtc_vad) | constants of Google's unmodified WebRTC VAD | F1 0.810 to 0.859 on LibriParty eval |
+| [`mnist/`](https://github.com/devanmolsharma/learnc/tree/main/examples/mnist) | 7,850 or 25,450 weights | 92.3% (linear) and 96.4% (MLP) on MNIST |
+| [`count/`](https://github.com/devanmolsharma/learnc/tree/main/examples/count) | a counting rule, trained on lengths 1 to 10 | 97.1% exact on lengths 40 to 64; a neural network on the same data gets 0% |
+| [`rules/`](https://github.com/devanmolsharma/learnc/tree/main/examples/rules) | which features a 2-of-3 rule reads, directions, thresholds | recovers the hidden rule |
+| [`formula/`](https://github.com/devanmolsharma/learnc/tree/main/examples/formula) | inputs and operators of a formula | recovers `(x3 + x0) * (x1 - x2)` exactly in 11 s |
+| [`discover/`](https://github.com/devanmolsharma/learnc/tree/main/examples/discover) | Strassen-type matrix product, sorting networks | finds exact and optimal algorithms |
 
-More detail on JPEG, including the results by bitrate: [examples/tune_jpeg](examples/tune_jpeg). The gain is at
+More detail on JPEG, including the results by bitrate: [examples/tune_jpeg](https://github.com/devanmolsharma/learnc/tree/main/examples/tune_jpeg). The gain is at
 medium and high quality (1 to 4 bits per pixel); at very low bitrates there is none.
 
 ## How it works
@@ -203,8 +218,6 @@ also write small models in C with `learned` variables when you want one.
 **How is overfitting handled?** 20% of your examples are held out by default, the best values on them are kept,
 and any change that doesn't help on them is reverted.
 
-## Tests
+## License
 
-```bash
-pip install -e ".[dev]" && pytest
-```
+[MIT](https://github.com/devanmolsharma/learnc/blob/main/LICENSE)

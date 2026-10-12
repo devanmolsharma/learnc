@@ -3,8 +3,17 @@ import hashlib, json, os, re, shutil, subprocess, tempfile
 from .ir import parse_module
 
 CLANG = os.environ.get("LEARNC_CLANG") or shutil.which("clang") or "clang"
-LLVM_LINK = next((p for p in (os.environ.get("LEARNC_LLVM_LINK"), "/usr/lib/llvm-18/bin/llvm-link", shutil.which("llvm-link"))
-                  if p and os.path.exists(p)), "llvm-link")
+def _find_llvm_link():
+    """llvm-link: $LEARNC_LLVM_LINK, then PATH (plain or versioned), then the usual LLVM install folders."""
+    import glob
+    found = [os.environ.get("LEARNC_LLVM_LINK"), shutil.which("llvm-link")]
+    found += [shutil.which(f"llvm-link-{v}") for v in range(25, 10, -1)]
+    found += sorted(glob.glob("/usr/lib/llvm-*/bin/llvm-link") + glob.glob("/usr/local/opt/llvm/bin/llvm-link")
+                    + glob.glob("/opt/homebrew/opt/llvm/bin/llvm-link"), reverse=True)
+    return next((p for p in found if p and os.path.exists(p)), "llvm-link")
+
+
+LLVM_LINK = _find_llvm_link()
 INCLUDE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "include")
 # -O1: registers in SSA form, simple loops. No vectors and no fused multiply-add, so the IR and the native code agree.
 FLAGS = ["-O1", "-fno-unroll-loops", "-fno-vectorize", "-fno-slp-vectorize", "-ffp-contract=off", "-fno-math-errno",

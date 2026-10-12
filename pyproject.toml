@@ -1,13 +1,36 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "learnc"
 version = "0.1.0"
-description = "C programs whose `learned` variables are fitted to examples."
+description = "Auto-tune the magic numbers in C code from data: thresholds, tables and weights, written back as plain C."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Anmol Sharma" }]
 requires-python = ">=3.10"
 dependencies = ["torch>=2.2", "numpy"]
+keywords = ["c", "autotuning", "parameter-tuning", "optimization", "llvm", "clang", "pytorch", "jpeg",
+            "compression", "quantization-tables", "differentiable-programming", "program-synthesis", "embedded"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+[project.urls]
+Homepage = "https://github.com/devanmolsharma/learnc"
+Source = "https://github.com/devanmolsharma/learnc"
+Issues = "https://github.com/devanmolsharma/learnc/issues"
 
 [project.optional-dependencies]
 dev = ["pytest"]
