@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "learnc"
+version = "0.1.0"
+description = "C programs whose `learned` variables are fitted to examples."
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+learnc = "learnc.cli:main"
+
+[tool.setuptools]
+packages = ["learnc"]
+
+[tool.setuptools.package-data]
+learnc = ["include/*.h"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

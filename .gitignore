@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv*/
+venv/
+
+# Local data, logs and editor settings
+data/
+logs/
+.claude/
+.vscode/
+.idea/
+
+# Outputs of learnc and the examples
+*.pt
+*.npy
+*.so
+*.o
+*.trained.c
+*.found.c
+*.values.pt
+tuned/
+TUNING_REPORT.txt
