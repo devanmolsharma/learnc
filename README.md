@@ -23,6 +23,12 @@ learnc tune score.c --data examples.pt --tune encoder.h:YQT,UVQT --out tuned/
 
 Each result runs on a laptop CPU in minutes and is reproducible from [`examples/`](https://github.com/devanmolsharma/learnc/tree/main/examples).
 
+![JPEG: file size vs quality with standard, mozjpeg and learnc-tuned tables](https://raw.githubusercontent.com/devanmolsharma/learnc/main/docs/images/jpeg_results.png)
+
+The output is your own file with new numbers. Here is the start of the diff learnc wrote for Google's WebRTC VAD:
+
+![diff of vad_core.c after tuning](https://raw.githubusercontent.com/devanmolsharma/learnc/main/docs/images/diff.png)
+
 ---
 
 ## Why learnc
@@ -99,6 +105,12 @@ r = learnc.tune("score.c", [images, qualities], sources=["encoder.c"],
 print(r.report())               # held-out loss before and after, every changed constant
 r.write("tuned/")               # your files with the new numbers, plus TUNING_REPORT.txt
 ```
+
+Every run ends with a report of what changed and how much it helped on held-out data (WebRTC VAD, all constants):
+
+![tuning report](https://raw.githubusercontent.com/devanmolsharma/learnc/main/docs/images/report.png)
+
+![WebRTC VAD F1 and accuracy before and after tuning](https://raw.githubusercontent.com/devanmolsharma/learnc/main/docs/images/webrtc_vad.png)
 
 **Read the diff before you ship it.** learnc optimises exactly what you score. In the WebRTC example it set
 `kMaxSpeechFrames` to -2, which makes the detector always use its long hangover. That is valid C and it helped on
