@@ -30,6 +30,12 @@ class NotVectorizable(Exception):
 class Loop:
     def __init__(self, header, blocks):
         self.header, self.blocks, self.inner, self.parent, self.plan, self.planned = header, blocks, [], None, None, False
+        self.reason = None                                                # why it cannot run all at once
+
+
+def _no(L, reason):
+    L.reason = reason
+    return None
 
 
 def _succ(f, b):
@@ -81,40 +87,42 @@ def plan_loop(module, f, L):
     pre = [p for p in preds[L.header] if p not in L.blocks]
     latches = [p for p in preds[L.header] if p in L.blocks]
     exits = [(b, s) for b in L.blocks for s in _succ(f, b) if s not in L.blocks]
-    if len(pre) != 1 or len(latches) != 1 or len(exits) != 1: return None
+    if len(pre) != 1 or len(latches) != 1 or len(exits) != 1: return _no(L, "more than one entry, back edge or exit")
     exiting, exit_ = exits[0]
     t = f.blocks[exiting].term
-    if t.op != "br" or len(t.args) != 1: return None
+    if t.op != "br" or len(t.args) != 1: return _no(L, "its exit is not a conditional branch")
     inner = [plan_loop(module, f, M) for M in L.inner]
-    if any(p is None for p in inner): return None
+    if any(p is None for p in inner):
+        return _no(L, "an inner loop runs step by step: " + next(M.reason for M, p in zip(L.inner, inner) if p is None))
     def nested(M): return [M] + [x for K in M.inner for x in nested(K)]
     inner_exiting = {K.plan.exiting for M in L.inner for K in nested(M)}       # exits of every loop inside
     defs = {}
     for b in L.blocks:
         blk = f.blocks[b]
-        if blk.term.op != "br": return None
-        if len(blk.term.args) == 1 and b != exiting and b not in inner_exiting: return None     # a data-dependent branch
+        if blk.term.op != "br": return _no(L, "a switch inside")
+        if len(blk.term.args) == 1 and b != exiting and b not in inner_exiting: return _no(L, "a branch that depends on data")
         for i in blk.insts + blk.phis:
             if i.name: defs[i.name] = i
-            if i.op == "alloca": return None
+            if i.op == "alloca": return _no(L, "a local variable created inside")
             if i.op == "call":
-                if i.extra["fn"] in module.functions: return None
+                if i.extra["fn"] in module.functions:
+                    return _no(L, f"a call to {i.extra['fn'][1:]} (declare it static inline __attribute__((always_inline)))")
                 name = i.extra["fn"][1:]; base = name.split(".")[1] if name.startswith("llvm.") else name
-                if base not in MATH and base != "lifetime": return None
+                if base not in MATH and base != "lifetime": return _no(L, f"a call to {base}, which is not a math function")
     hdr = f.blocks[L.header]; ind = None
     pre_name, latch_name = f.blocks[pre[0]].name, f.blocks[latches[0]].name
     for ph in hdr.phis:
         inc = dict((src, v) for v, src in ph.extra["incoming"])
-        if set(inc) != {pre_name, latch_name}: return None
+        if set(inc) != {pre_name, latch_name}: return _no(L, "a value entering from elsewhere")
         init, back = inc[pre_name], inc[latch_name]
         upd = defs.get(back[1]) if back[0] == "reg" else None
         if (ind is None and init[0] == "const" and upd is not None and upd.op == "add" and ("reg", ph.name) in upd.args
                 and any(a[0] == "const" and a[1] == 1 for a in upd.args)):
             ind = (ph.name, init[1], upd.name)
-    if ind is None: return None
+    if ind is None: return _no(L, "no counter i = constant, i + 1")
     name, start, nxt = ind
     cond = defs.get(t.args[0][1]) if t.args[0][0] == "reg" else None
-    if cond is None or cond.op != "icmp" or cond.extra["pred"] not in _TESTS: return None
+    if cond is None or cond.op != "icmp" or cond.extra["pred"] not in _TESTS: return _no(L, "its exit test does not compare the counter")
     def val(a, i):
         if a == ("reg", name): return i
         if a == ("reg", nxt): return i + 1
@@ -128,9 +136,9 @@ def plan_loop(module, f, L):
             trips += 1
             if test(val(cond.args[0], i), val(cond.args[1], i)) != stay: break
             i += 1
-            if trips > 1_000_000: return None
+            if trips > 1_000_000: return _no(L, "more than 1,000,000 iterations")
     except KeyError:
-        return None
+        return _no(L, "its trip count depends on data")
     L.plan = Plan(pre=pre[0], latch=latches[0], exiting=exiting, exit=exit_, ind=name, start=start, next=nxt,
                   trips=trips, reductions=[ph for ph in hdr.phis if ph.name != name])
     return L.plan

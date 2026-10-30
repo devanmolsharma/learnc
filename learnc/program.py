@@ -3,7 +3,7 @@ import os
 import torch
 from .build import BuildError, c_type, compile_ir, signatures
 from .ir import scalar_of, size_of
-from .machine import DTYPE, Machine, Mix, Ptr, Relaxed, RunError, Soft, _flatten, unsigned, wrap
+from .machine import DTYPE, Machine, Mix, Ptr, Relaxed, RunError, Soft, _flatten, expect, unsigned, wrap
 
 
 class Learned:
@@ -140,6 +140,25 @@ class Program:
             self._native = Native(self)
         return self._native
 
+    def loop_report(self):
+        """[(function, loop, how it runs)] for every outermost loop the entry function reaches: "all at once (N
+        iterations)" when the runner executes it as tensor operations, else "step by step: <why>". A loop that runs
+        step by step is much slower to train through."""
+        from .vectorize import find_loops, plan_loop
+        out, seen, todo = [], set(), ["@" + self.entry]
+        while todo:
+            fname = todo.pop()
+            if fname in seen or fname not in self.module.functions: continue
+            seen.add(fname); f = self.module.functions[fname]
+            for blk in f.blocks:
+                todo += [i.extra["fn"] for i in blk.insts if i.op == "call" and i.extra.get("fn") in self.module.functions]
+            for h, L in sorted(find_loops(f).items()):
+                if L.parent is not None: continue
+                plan = plan_loop(self.module, f, L)
+                out.append((fname[1:], f.blocks[h].name, f"all at once ({plan.trips} iterations)" if plan else
+                            f"step by step: {L.reason}"))
+        return out
+
     # ------------------------------------------------------------------ running
     def _lane_args(self, mach, inputs, B):
         if len(inputs) != len(self.params):
@@ -199,7 +218,7 @@ class Program:
     def fit(self, *inputs, target, steps=1000, batch=128, lr=1e-2, temperature=1.0, choices="auto", samples=8,
             polish=3, restarts=None, choice_init=0.01, noise=1.0, sparsity=0.0, optimizer="adam", engine="auto", seed=0,
             gradient="auto", objective="match", sigma=0.05, pairs=16, validation=None, keep_close=0.0, workers=None,
-            verbose=False):
+            space=None, lr_scale=None, penalty=None, callback=None, eval_every=None, verbose=False):
         """Fit the learned variables so that the program's output matches `target` on the examples.
 
         Real-valued learned variables: gradient descent through the program; comparisons that depend on them are soft
@@ -232,6 +251,17 @@ class Program:
           minimise, e.g. an error rate or a size; target is then ignored); validation (inputs, target): the values
           that score best on it are kept (early stopping); keep_close: pull toward the starting values; workers:
           parallel worker processes (default: CPU cores for perturbation gradients).
+        Runner engine (adam):
+          objective "minimize": the entry function returns a cost per example and its mean is minimised (target may be
+            None), e.g. a distance computed in C between what the program makes and a reference.
+          validation (inputs, target): evaluated every `eval_every` steps (default steps / 20) with the exact program;
+            the real values that score best on it are kept (early stopping).
+          space {name: "log"}: fit a positive variable in log space (frequencies, scales, bandwidths), so a step
+            changes it by a ratio rather than an amount. ("range", lo, hi) keeps it within lo..hi and ("logrange", lo,
+            hi) does so on a log scale (a sigmoid of the fitted number); lo and hi may be numbers or per-element lists.
+          lr_scale {name: factor}: per-variable learning rate (lr * factor), for variables in different units.
+          penalty(values) -> scalar tensor: added to the loss (smoothness, priors); values by name, in C units.
+          callback(step, values, validation_loss): called every `eval_every` steps, e.g. to write progress samples.
         The result is in self.values."""
         if engine == "native" or (engine == "auto" and self.native_only):
             from .native_fit import fit_native
@@ -249,20 +279,28 @@ class Program:
                 method = ("relax", "sample")[r % 2] if choices == "auto" else choices
                 self.fit(*inputs, target=target, steps=steps, batch=batch, lr=lr, temperature=temperature, choices=method,
                          samples=samples, polish=polish, restarts=1, choice_init=choice_init, noise=noise, sparsity=sparsity,
-                         optimizer=optimizer, seed=seed + r,
-                         verbose=verbose)
+                         optimizer=optimizer, seed=seed + r, objective=objective, validation=validation, space=space,
+                         lr_scale=lr_scale, penalty=penalty, callback=callback, eval_every=eval_every, verbose=verbose)
                 score = self.score(*inputs, target=target)
                 if verbose: print(f"  restart {r + 1}/{restarts} ({method}): score {score:.4f}", flush=True)
                 if best is None or score > best[0]: best = (score, self.values, self.history)
             _, self.values, self.history = best
             return self
         if choices == "auto": choices = "relax"
+        self._space, self._objective = dict(space or {}), objective
+        for n, sp in self._space.items():
+            if n not in self.learned or self.learned[n].etype[0] != "fp": raise ValueError(f"space: {n} is not a learned real variable")
+            bounded = isinstance(sp, (tuple, list)) and len(sp) == 3 and sp[0] in ("range", "logrange")
+            if sp not in ("linear", "log") and not bounded:
+                raise ValueError(f"space: {n}: use 'linear', 'log', ('range', lo, hi) or ('logrange', lo, hi), not {sp!r}")
+        lr_scale = dict(lr_scale or {})
         g = torch.Generator().manual_seed(seed); torch.manual_seed(seed)
         floats, logits, start = {}, {}, self.values or {}
         for n, L in self.learned.items():
             if L.etype[0] == "fp":
                 v = torch.as_tensor(start[n]).reshape(-1).float() if n in start else torch.tensor(L.init, dtype=torch.float32)
                 if n not in start and L.count > 1 and not v.any(): v = torch.randn(L.count, generator=g) * 0.1  # break symmetry
+                v = self._to_space(n, v)
                 floats[n] = torch.nn.Parameter(v.to(self.device))
             elif choices == "continuous":
                 if L.range is None: raise ValueError(f"{n}: choices='continuous' needs a range (learned_in), not a list of values")
@@ -271,8 +309,17 @@ class Program:
             else:
                 logits[n] = torch.nn.Parameter((torch.randn(L.count, len(L.choices), generator=g) * choice_init).to(self.device))
         if not floats and not logits: raise ValueError(f"{os.path.basename(self.path)} has no learned variables")
-        X = [torch.as_tensor(x).to(self.device) for x in inputs]; Y = torch.as_tensor(target).to(self.device)
-        self.history = []
+        X = [torch.as_tensor(x).to(self.device) for x in inputs]
+        if target is None:
+            if objective != "minimize": raise ValueError("target is needed unless objective='minimize'")
+            target = torch.zeros(len(X[0]))
+        Y = torch.as_tensor(target).to(self.device)
+        V = None
+        if validation is not None:
+            vx, vy = validation
+            vx = [torch.as_tensor(x).to(self.device) for x in vx]
+            V = (vx, torch.as_tensor(vy if vy is not None else torch.zeros(len(vx[0]))).to(self.device))
+        self.history, self.validation_history = [], []
 
         def phase(n_steps, fixed=None, mode=choices):
             params = list(floats.values()) + ([] if fixed is not None else list(logits.values()))
@@ -286,20 +333,24 @@ class Program:
                 opt = torch.optim.LBFGS(params, lr=1, max_iter=20, history_size=50, line_search_fn="strong_wolfe")
                 def closure():
                     opt.zero_grad()
-                    lt = {"@" + n: p.to(DTYPE[self.learned[n].etype[1]]) for n, p in floats.items()}
+                    lt = self._float_tensors(floats)
                     lt.update({"@" + n: v for n, v in (fixed or {}).items()})
-                    loss = -log_likelihood(self.run(*xs, training=True, temperature=temperature, learned_tensors=lt), ys).float().mean()
+                    loss = -self._ll(self.run(*xs, training=True, temperature=temperature, learned_tensors=lt), ys).float().mean()
                     loss.backward(); return loss
                 for step in range(n_steps):
                     loss = float(opt.step(closure)); self.history.append(loss)
                     if verbose and (step + 1) % max(1, n_steps // 10) == 0: print(f"  step {step + 1}/{n_steps}  loss {loss:.3g}", flush=True)
                 return
-            opt = torch.optim.Adam(params, lr=lr); sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_steps)
+            groups = [{"params": [p], "lr": lr * lr_scale.get(n, 1.0)} for n, p in floats.items()]
+            if fixed is None and logits: groups.append({"params": list(logits.values()), "lr": lr})
+            opt = torch.optim.Adam(groups, lr=lr); sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_steps)
+            every = eval_every or max(1, n_steps // 20)
+            best = None
             S = samples if (logits and fixed is None and mode == "sample") else 1
             for step in range(n_steps):
                 k = torch.randint(0, len(Y), (min(batch, len(Y)),), device=self.device); b = len(k)
                 xs, ys = [x[k].repeat_interleave(S, 0) for x in X], Y[k].repeat_interleave(S, 0)  # lane = example * S + sample
-                lt = {"@" + n: p.to(DTYPE[self.learned[n].etype[1]]) for n, p in floats.items()}
+                lt = self._float_tensors(floats)
                 logp = 0
                 for n, lg in logits.items():
                     L = self.learned[n]
@@ -315,11 +366,13 @@ class Program:
                         tau = max(0.1, 1.0 - 0.9 * step / max(1, int(0.7 * n_steps)))                   # anneal 1 -> 0.1
                         gumbel = -noise * torch.log(-torch.log(torch.rand_like(lg).clamp(1e-9, 1 - 1e-9)))
                         lt["@" + n] = Relaxed(torch.softmax((lg + gumbel) / tau, -1), self._choices(n))
-                ll = log_likelihood(self.run(*xs, training=True, temperature=temperature, learned_tensors=lt), ys).float()
+                ll = self._ll(self.run(*xs, training=True, temperature=temperature, learned_tensors=lt), ys).float()
                 loss = -ll.mean()
                 if mode == "continuous" and fixed is None and step > n_steps // 2:              # pull towards whole numbers
                     strength = 10.0 * ((step - n_steps // 2) / (n_steps - n_steps // 2)) ** 2
                     loss = loss + strength * sum(((lg - lg.round().detach()) ** 2).sum() for lg in logits.values())
+                if penalty is not None and floats:
+                    loss = loss + penalty({n: self._from_space(n, p) for n, p in floats.items()})
                 if sparsity and fixed is None:
                     for n, lg in logits.items():
                         if mode == "continuous": loss = loss + sparsity * lg.abs().sum()
@@ -334,6 +387,17 @@ class Program:
                 opt.zero_grad(); loss.backward(); opt.step(); sch.step(); self.history.append(loss.item())
                 if verbose and (step + 1) % max(1, n_steps // 10) == 0:
                     print(f"  step {step + 1}/{n_steps}  loss {loss.item():.4f}", flush=True)
+                if (V is not None or callback is not None) and ((step + 1) % every == 0 or step + 1 == n_steps):
+                    vl = None
+                    if V is not None:
+                        vl = self._validation_loss(V, floats, logits, fixed); self.validation_history.append((step + 1, vl))
+                        if best is None or vl < best[0]: best = (vl, {n: p.detach().clone() for n, p in floats.items()})
+                        if verbose: print(f"  step {step + 1}/{n_steps}  validation loss {vl:.4f}", flush=True)
+                    if callback is not None:
+                        callback(step + 1, {n: self._from_space(n, p).detach().reshape(self.learned[n].shape)
+                                            for n, p in floats.items()}, vl)
+            if best is not None:                                            # early stopping: keep the best on validation
+                for n, p in best[1].items(): floats[n].data.copy_(p)
 
         if not logits: phase(steps)
         else:
@@ -348,17 +412,80 @@ class Program:
                 phase(max(1, steps // (4 * polish)), fixed=fixed)          # re-fit the real numbers around the choices
             phase(steps // 4, fixed=fixed)
             self._simplify(fixed, floats, X, Y, temperature)
-            self.values = {n: p.detach().reshape(self.learned[n].shape) for n, p in floats.items()}
+            self.values = {n: self._from_space(n, p).detach().reshape(self.learned[n].shape) for n, p in floats.items()}
             for n in logits: self.values[n] = fixed[n].reshape(self.learned[n].shape)
             return self
-        self.values = {n: p.detach().reshape(self.learned[n].shape) for n, p in floats.items()}
+        self.values = {n: self._from_space(n, p).detach().reshape(self.learned[n].shape) for n, p in floats.items()}
         for n, lg in logits.items(): self.values[n] = self._choices(n)[lg.argmax(-1)].reshape(self.learned[n].shape)
         return self
+
+    def _bounds(self, n, sp, like):
+        lo, hi = (torch.as_tensor(b, dtype=like.dtype, device=like.device).reshape(-1) for b in sp[1:])
+        if sp[0] == "logrange": lo, hi = torch.log(lo), torch.log(hi)
+        return lo, hi
+
+    def _to_space(self, n, v):
+        """A real variable's starting value in C to the space it is fitted in (see `space`)."""
+        sp = getattr(self, "_space", {}).get(n, "linear")
+        if sp == "linear": return v
+        if (sp == "log" or sp[0] == "logrange") and (v <= 0).any():
+            raise ValueError(f"space: {n} must start positive to be fitted on a log scale")
+        if sp == "log": return torch.log(v)
+        lo, hi = self._bounds(n, sp, v)
+        x = torch.log(v) if sp[0] == "logrange" else v
+        u = ((x - lo) / (hi - lo)).clamp(0.01, 0.99)              # at or past a bound: start just inside, where it can move
+        return torch.log(u / (1 - u))
+
+    def _from_space(self, n, p):
+        """A real variable from the space it is fitted in (see `space`) to its value in C."""
+        sp = getattr(self, "_space", {}).get(n, "linear")
+        if sp == "linear": return p
+        if sp == "log": return torch.exp(p)
+        lo, hi = self._bounds(n, sp, p)
+        x = lo + (hi - lo) * torch.sigmoid(p)
+        return torch.exp(x) if sp[0] == "logrange" else x
+
+    def _float_tensors(self, floats, detach=False):
+        return {"@" + n: self._from_space(n, p.detach() if detach else p).to(DTYPE[self.learned[n].etype[1]])
+                for n, p in floats.items()}
+
+    def _ll(self, out, target):
+        """Per lane: how good the output is (higher is better), for the current objective."""
+        if getattr(self, "_objective", "match") == "minimize": return -expect(out).double()
+        return log_likelihood(out, target)
+
+    def _validation_loss(self, V, floats, logits, fixed, chunk=8192):
+        """Mean loss on the validation examples, running the program exactly (choices decided)."""
+        (vx, vy), n, tot = V, len(V[1]), 0.0
+        lt = self._float_tensors(floats, detach=True)
+        for m, lg in logits.items():
+            lt["@" + m] = fixed[m] if fixed is not None else self._choices(m)[lg.detach().argmax(-1)]
+        with torch.no_grad():
+            for i in range(0, n, chunk):
+                k = slice(i, min(i + chunk, n))
+                tot -= self._ll(self.run(*[x[k] for x in vx], learned_tensors=lt), vy[k]).double().sum().item()
+        return tot / n
+
+    def write_sources(self, out_dir, values=None):
+        """Write every source file that defines learned variables (the entry file and `sources`) into out_dir with the
+        fitted values filled in, plus a plain-C learnc.h there for headers that include it (build with -I out_dir).
+        Returns the source paths written."""
+        from .bake import HEADER, bake
+        from .build import learned_declarations
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "learnc.h"), "w") as f:
+            f.write("#ifndef LEARNC_H\n#define LEARNC_H\n" + HEADER + "#endif\n")
+        out = []
+        for path in self.paths:
+            names = set(learned_declarations(path, self.flags))
+            if not names & set(self.learned): continue
+            out.append(bake(self, os.path.join(out_dir, os.path.basename(path)), values=values, source=path))
+        return out
 
     def _polish(self, fixed, floats, X, Y, temperature, n_eval=1024):
         """One round of exact local search over the learned choices. Changes `fixed` in place; True if anything changed."""
         k = torch.randperm(len(Y), device=self.device)[:n_eval]; xs, ys = [x[k] for x in X], Y[k]; b = len(k)
-        lt0 = {"@" + n: p.detach().to(DTYPE[self.learned[n].etype[1]]) for n, p in floats.items()}
+        lt0 = self._float_tensors(floats, detach=True)
         changed = False
         with torch.no_grad():
             for n, cur in fixed.items():
@@ -368,7 +495,7 @@ class Program:
                     lt = dict(lt0); lt.update({"@" + m: v.reshape(1, -1).expand(K * b, -1) for m, v in fixed.items() if m != n})
                     lt["@" + n] = cand.repeat_interleave(b, 0)                                   # lane = candidate * b + example
                     out = self.run(*[x.repeat(K, *[1] * (x.dim() - 1)) for x in xs], training=True, temperature=temperature, learned_tensors=lt)
-                    score = log_likelihood(out, ys.repeat(K)).float().reshape(K, b).mean(1)
+                    score = self._ll(out, ys.repeat(K)).float().reshape(K, b).mean(1)
                     best = int(score.argmax())
                     if vals[best] != cur[e] and score[best] > score[int((vals == cur[e]).nonzero()[0])] + 1e-6:
                         cur[e] = vals[best]; changed = True
@@ -379,16 +506,16 @@ class Program:
         k = torch.arange(min(n, len(target)))
         with torch.no_grad():
             out = self.run(*[torch.as_tensor(x)[k] for x in inputs], values=self.values, training=True)
-            return log_likelihood(out, torch.as_tensor(target)[k].to(self.device)).float().mean().item()
+            return self._ll(out, torch.as_tensor(target)[k].to(self.device)).float().mean().item()
 
     def _simplify(self, fixed, floats, X, Y, temperature, n_eval=1024, tol=1e-6):
         """Set each choice to 0 (where 0 is allowed) if the fit does not get worse. Changes `fixed` in place."""
         k = torch.randperm(len(Y), device=self.device)[:n_eval]; xs, ys = [x[k] for x in X], Y[k]
-        lt0 = {"@" + n: p.detach().to(DTYPE[self.learned[n].etype[1]]) for n, p in floats.items()}
+        lt0 = self._float_tensors(floats, detach=True)
         def score():
             lt = dict(lt0); lt.update({"@" + n: v for n, v in fixed.items()})
             with torch.no_grad():
-                return log_likelihood(self.run(*xs, training=True, temperature=temperature, learned_tensors=lt), ys).float().mean().item()
+                return self._ll(self.run(*xs, training=True, temperature=temperature, learned_tensors=lt), ys).float().mean().item()
         base = score()
         for n, cur in fixed.items():
             if 0 not in self.learned[n].choices: continue
@@ -417,7 +544,7 @@ class Program:
         names = list(floats); shapes = [floats[n].shape for n in names]; sizes = [floats[n].numel() for n in names]
         def residuals(flat):
             parts = torch.split(flat, sizes)
-            lt = {"@" + n: p.reshape(s).to(DTYPE[self.learned[n].etype[1]]) for n, p, s in zip(names, parts, shapes)}
+            lt = {"@" + n: self._from_space(n, p.reshape(s)).to(DTYPE[self.learned[n].etype[1]]) for n, p, s in zip(names, parts, shapes)}
             lt.update({"@" + n: v for n, v in (fixed or {}).items()})
             out = self.run(*xs, training=True, temperature=temperature, learned_tensors=lt)
             if isinstance(out, (Mix, Soft)): raise ValueError("optimizer='lm' needs a program with a real-valued output")
@@ -434,7 +561,7 @@ class Program:
             example's gradient into its own copy: the whole Jacobian for about the cost of two forward passes."""
             copies = theta.float().expand(len(ys), -1).clone().requires_grad_()
             parts = torch.split(copies, sizes, dim=1)
-            lt = {"@" + n: p.to(DTYPE[self.learned[n].etype[1]]) for n, p in zip(names, parts)}
+            lt = {"@" + n: self._from_space(n, p).to(DTYPE[self.learned[n].etype[1]]) for n, p in zip(names, parts)}
             lt.update({"@" + n: v for n, v in (fixed or {}).items()})
             r = self.run(*xs, training=True, temperature=temperature, learned_tensors=lt).double() - ys
             r.sum().backward()

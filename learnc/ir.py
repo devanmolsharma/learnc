@@ -187,6 +187,17 @@ def parse_value(c, t):
     raise IRError(f"cannot read value {tok!r}")
 
 
+def _as_array(t, init):
+    """clang writes an array whose initializer ends in zeros as <{ [a x T], [b x T] zeroinitializer }>: read it as the
+    array [a+b x T] it is (code indexes it through that array type), so it needs no byte-addressed memory."""
+    if t[0] != "struct" or not t[1] or not all(f[0] == "array" and f[2] == t[1][0][2] for f in t[1]): return t, init
+    items = []
+    for k, f in enumerate(t[1]):
+        part = None if init is None else init[k]
+        items += [None] * f[1] if part is None else list(part)
+    return ("array", sum(f[1] for f in t[1]), t[1][0][2]), items
+
+
 def parse_const_init(c, t):
     """A global initializer: nested lists of python numbers (or None for zero)."""
     tok = c.peek()
@@ -445,6 +456,7 @@ def parse_module(text):
                 while c.peek() not in ("global", "constant"): c.next()
                 const = c.next() == "constant"; t = parse_type(c)
                 init = parse_const_init(c, t) if not c.done() else None
+                t, init = _as_array(t, init)
                 globals_[gname] = Global(gname, t, init, const)
             except Exception as e:
                 unsupported[gname] = str(e)

@@ -3,7 +3,7 @@ functions and variables are reachable), sets the learned variables and calls the
 import ctypes, hashlib, os
 import numpy as np
 import torch
-from .build import cache_dir, compile_shared, learned_declarations
+from .build import _dependencies, cache_dir, compile_shared, learned_declarations
 
 C_NAME = {("fp", 32): "float", ("fp", 64): "double", ("int", 8, True): "signed char", ("int", 8, False): "unsigned char",
           ("int", 16, True): "short", ("int", 16, False): "unsigned short", ("int", 32, True): "int",
@@ -23,9 +23,17 @@ class Native:
         d = cache_dir(prog.paths, getattr(prog, "flags", ()))
         lines = [f'#include "{prog.path}"', "#include <string.h>"]
         local = set(learned_declarations(prog.path, getattr(prog, "flags", ())))    # learned variables of the entry file
+        read = ("\n".join(open(p, errors="replace").read() for p in _dependencies(prog.paths, getattr(prog, "flags", ())))
+                if set(prog.learned) - local else "")   # every file the build reads, headers included
         for n, L in prog.learned.items():
             if n in local: lines.append(f"void learnc_set_{n}(const void *v) {{ memcpy((void *)&{n}, v, sizeof({n})); }}")
-            else: lines.append(f"void learnc_set_{n}(const void *v);   /* defined in a lifted source file */")
+            elif f"learnc_set_{n}" in read:
+                lines.append(f"void learnc_set_{n}(const void *v);   /* defined in a lifted source file */")
+            else:                                     # a global of another source file: reach it by its external name
+                et = L.etype if L.etype[0] == "fp" else (L.etype[0], L.etype[1], True)
+                dims = "".join(f"[{d}]" for d in L.shape)
+                lines.append(f"extern {_cname(et)} {n}{dims};")
+                lines.append(f"void learnc_set_{n}(const void *v) {{ memcpy((void *)&{n}, v, sizeof({n})); }}")
         params = []
         call = []
         for k, (name, ct) in enumerate(prog.params):

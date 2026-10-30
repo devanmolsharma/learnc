@@ -161,6 +161,33 @@ trained model on all 10,000 test images.
 | `learned_of(1, 2, 4, 8) int k;` | a choice from a list of numbers |
 | `learned_op(ADD, SUB, MUL) op[3];` | operators (ADD, SUB, MUL, DIV, MAX, MIN, LEFT, RIGHT), applied with `learnc_apply(op[k], a, b)` |
 
+## Libraries with learned tables
+
+The learned values can live in their own source file, shared by every part of a multi-file library: declare them
+`extern learned` in a header, define them once in `tables.c`, and let the entry function be a cost computed in C.
+
+```c
+/* tables.h */   extern learned float freq[3], gain[3];
+/* tables.c */   learned float freq[3] = {100, 100, 100}, gain[3];
+/* model.c  */   float distance(int k, const float target[8]) { ... return err; }   /* uses freq[k], gain[k] */
+```
+
+```python
+p = learnc.Program("model.c", sources=["tables.c"], flags=["-I", "include"])
+p.fit(k, measured, target=None, objective="minimize",          # the entry returns a cost: minimise its mean
+      space={"freq": ("logrange", 50, 5000), "gain": "linear"}, # log scale, kept in range
+      lr_scale={"gain": 10.0},                                  # per-variable step size, for mixed units
+      penalty=lambda v: 1e-3 * v["gain"].pow(2).sum(),          # priors and smoothness, in C units
+      validation=((k_val, measured_val), None),                 # early stopping on held-out examples
+      callback=lambda step, values, val_loss: ...)              # progress: render samples, log
+p.write_sources("tuned/")                                       # tuned/tables.c (+ a plain learnc.h)
+```
+
+`space` takes `"log"`, `("range", lo, hi)` or `("logrange", lo, hi)` per variable (bounds may be per element). The
+native engine reaches learned globals of any source file, and `write_sources` writes every file that defines them.
+Keep functions called inside hot loops `static inline __attribute__((always_inline))`: the runner executes a loop as
+one tensor operation only when its body makes no calls.
+
 ## Examples
 
 | Example | What is learned | Result |

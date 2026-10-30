@@ -18,10 +18,17 @@ def _literal(v, fp_bits):
     return s + ("f" if fp_bits == 32 else "")
 
 
-def _braces(flat, shape, fmt):
+def _braces(flat, shape, fmt, top=True):
     if not shape: return fmt(flat[0])
     step = len(flat) // shape[0]
-    return "{" + ", ".join(_braces(flat[i * step:(i + 1) * step], shape[1:], fmt) for i in range(shape[0])) + "}"
+    items = [_braces(flat[i * step:(i + 1) * step], shape[1:], fmt, False) for i in range(shape[0])]
+    one_line = "{" + ", ".join(items) + "}"
+    if not top or len(shape) > 1 or len(one_line) <= 100: return one_line
+    lines, cur = [], ""                                 # long tables: wrapped, so a tuning diff shows what changed
+    for it in items:
+        if cur and len(cur) + len(it) + 2 > 100: lines.append(cur + ","); cur = ""
+        cur += (", " if cur else "") + it
+    return "{\n    " + "\n    ".join(lines + [cur]) + "\n}"
 
 
 def bake(prog, out_path, values=None, source=None):
